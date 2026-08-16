@@ -135,7 +135,11 @@ class IntrospectionExperiment:
         if self.verbose:
             print(f"Loading model: {model_name}")
 
-        self.device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+        self.device = torch.device(
+            "cuda" if torch.cuda.is_available()
+            else "mps" if torch.backends.mps.is_available()
+            else "cpu"
+        )
         self.model_name = model_name
 
         # Load model and tokenizer
