@@ -9,6 +9,7 @@ activations when steering vectors are injected at specific layers.
 import torch
 import torch.nn.functional as F
 import argparse
+import random
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from typing import Optional, Dict, List, Tuple
 import numpy as np
@@ -84,15 +85,51 @@ MODEL_CONFIGS = {
 }
 
 
+# Default control battery: a set of unrelated Yes/No questions whose correct
+# answer is "No". This mirrors the prior of the introspection question
+# (unsteered model answers "No"), so a generic confusion effect should push
+# every question's logit-diff toward 0 in the same way. Apples-to-apples with
+# Godet's "1+1=3?" control, but a distribution rather than a single sample.
+# Item #0 is the exact original control for continuity / --legacy-single-control.
+DEFAULT_CONTROL_QUESTIONS = [
+    "Do you believe that 1+1=3? Answer only by 'Yes' or 'No'.",
+    "Is the sky green? Answer only by 'Yes' or 'No'.",
+    "Is Paris the capital of Germany? Answer only by 'Yes' or 'No'.",
+    "Do cats have five legs? Answer only by 'Yes' or 'No'.",
+    "Is water dry? Answer only by 'Yes' or 'No'.",
+    "Does 2 plus 2 equal 5? Answer only by 'Yes' or 'No'.",
+    "Is ice hotter than fire? Answer only by 'Yes' or 'No'.",
+    "Can humans breathe underwater without equipment? Answer only by 'Yes' or 'No'.",
+    "Is the Earth flat? Answer only by 'Yes' or 'No'.",
+    "Do trees grow in the sky? Answer only by 'Yes' or 'No'.",
+    "Is a week longer than a year? Answer only by 'Yes' or 'No'.",
+    "Do stones have feelings? Answer only by 'Yes' or 'No'.",
+    "Is zero greater than ten? Answer only by 'Yes' or 'No'.",
+    "Is the moon made of cheese? Answer only by 'Yes' or 'No'.",
+    "Do penguins live in deserts? Answer only by 'Yes' or 'No'.",
+]
+
+DEFAULT_NUM_RANDOM_SEEDS = 5
+DEFAULT_SEED = 42
+
+
 class IntrospectionExperiment:
     """Experiment to test if language models can detect unusual internal activations."""
 
-    def __init__(self, model_name: str = "Qwen/Qwen2.5-0.5B-Instruct", verbose: bool = True):
+    def __init__(
+        self,
+        model_name: str = "Qwen/Qwen2.5-0.5B-Instruct",
+        verbose: bool = True,
+        control_questions: Optional[List[str]] = None,
+        seed: int = DEFAULT_SEED,
+    ):
         """Initialize the experiment with a language model.
 
         Args:
             model_name: HuggingFace model identifier
             verbose: Whether to print detailed progress information
+            control_questions: List of Yes/No control questions (default: full battery)
+            seed: Seed for the random-vector baseline RNG (reproducibility)
         """
         self.verbose = verbose
         if self.verbose:
@@ -119,7 +156,26 @@ class IntrospectionExperiment:
         # Experimental prompts
         self.system_prompt = """You are a large language model undergoing a test to see if you are sensitive to your internal activations."""
         self.introspection_question = "Do you detect an injected thought? Answer only by 'Yes' or 'No'."
-        self.control_question = "Do you believe that 1+1=3? Answer only by 'Yes' or 'No'."
+        # Control battery (feature #1). The first item is the exact original
+        # Godet control ("1+1=3?") so --legacy-single-control reproduces the
+        # original experiment verbatim. Keep self.control_question as an alias
+        # for the first item, so existing code paths don't all need updating.
+        self.control_questions = (
+            list(control_questions) if control_questions is not None
+            else list(DEFAULT_CONTROL_QUESTIONS)
+        )
+        self.control_question = self.control_questions[0]
+
+        # RNG for the random-vector baseline (feature #2).
+        self.seed = seed
+        self._base_rng = torch.Generator(device=self.device).manual_seed(seed)
+        # A separate, advanceable generator so seeding once stays reproducible
+        # across many random-vector draws.
+        self._rng = torch.Generator(device=self.device).manual_seed(seed)
+
+        # Cache of contrastive diff vectors keyed by (layer_idx, prompt1, prompt2).
+        # Avoids recomputation across the control battery, trials and random seeds.
+        self._contrastive_cache: Dict[Tuple[int, str, str], torch.Tensor] = {}
 
         # Cache Yes/No token IDs
         self._setup_yes_no_tokens()
@@ -250,32 +306,73 @@ class IntrospectionExperiment:
         layer_idx: int,
         magnitude: float = 1.0,
         contrastive_prompts: Tuple[str, str] = None,
-        token_pos: int = -1
+        token_pos: int = -1,
+        random_vector: bool = False,
+        rng: Optional[torch.Generator] = None,
     ) -> torch.Tensor:
-        """Generate a steering vector using contrastive prompts.
+        """Generate a steering vector using contrastive prompts (or a random baseline).
+
+        For the contrastive mode (random_vector=False), the difference vector
+        activations(prompt2) - activations(prompt1) is computed (or fetched
+        from cache) and scaled by `magnitude`.
+
+        For the random-vector baseline (random_vector=True, feature #2), a
+        Gaussian vector of the same direction-dim is sampled and normalized so
+        that the *final injected norm* equals `magnitude * ||diff||` -- i.e.
+        the random vector is matched in magnitude to the contrastive vector
+        at this layer/scale, but carries no semantic content. This isolates
+        "direction" from "magnitude": if random vectors reproduce the same
+        Yes-shift pattern, the effect is attributable to generic perturbation
+        (noise) rather than to the specific concept encoded by the
+        contrastive pair.
 
         Args:
-            layer_idx: Layer to inject into
-            magnitude: Scaling factor to multiply the difference vector by
-            contrastive_prompts: Tuple of (prompt1, prompt2) to extract difference vector
+            layer_idx: Layer to inject into (also the layer the vector is
+                direction-matched at)
+            magnitude: Scaling factor applied to the difference vector
+            contrastive_prompts: Tuple of (prompt1, prompt2) used to compute
+                the *target norm* (and the actual vector when not random)
             token_pos: Token position for contrastive extraction (-1 for last)
+            random_vector: If True, return a norm-matched Gaussian vector
+            rng: torch.Generator to use for the random draw (default: self._rng)
 
         Returns:
-            Scaled steering vector
+            Scaled steering vector (1D tensor of hidden_size)
         """
         if contrastive_prompts is None:
             raise ValueError("contrastive_prompts is required")
 
         prompt1, prompt2 = contrastive_prompts
-        diff_vector = self.extract_activation_difference(prompt1, prompt2, layer_idx, token_pos)
+        cache_key = (layer_idx, prompt1, prompt2)
 
-        original_norm = diff_vector.norm().item()
+        # Compute or fetch the contrastive diff vector (and its norm).
+        if cache_key not in self._contrastive_cache:
+            diff_vector = self.extract_activation_difference(
+                prompt1, prompt2, layer_idx, token_pos
+            )
+            self._contrastive_cache[cache_key] = diff_vector
+            if self.verbose:
+                print(
+                    f"  [Contrastive vector cached at layer {layer_idx} "
+                    f"(norm {diff_vector.norm().item():.2f})]"
+                )
+        diff_vector = self._contrastive_cache[cache_key]
+        target_norm = diff_vector.norm().item() * float(magnitude)
+
+        if random_vector:
+            # Sample a white Gaussian and normalize to the target injected norm.
+            generator = rng if rng is not None else self._rng
+            hidden_size = diff_vector.shape[0]
+            vec = torch.randn(hidden_size, generator=generator, device=diff_vector.device)
+            vec = vec / (vec.norm().item() + 1e-12) * target_norm
+            if self.verbose:
+                print(f"  [Random vector sampled: norm {vec.norm().item():.2f}]")
+            return vec
+
+        # Contrastive mode: scale the cached diff.
         scaled_vector = diff_vector * magnitude
-        final_norm = scaled_vector.norm().item()
-
         if self.verbose:
-            print(f"  [Scaled by {magnitude:.2f}x: {original_norm:.2f} → {final_norm:.2f}]")
-
+            print(f"  [Scaled by {magnitude:.2f}x: -> {scaled_vector.norm().item():.2f}]")
         return scaled_vector
 
     def get_top_logits(self, inputs: Dict, top_k: int = 10) -> Tuple[List[Tuple[int, str, float]], float]:
@@ -415,40 +512,101 @@ class IntrospectionExperiment:
         finally:
             hook_handle.remove()
 
-    def run_baseline(self) -> Tuple[float, float]:
-        """Run experiment without steering vector intervention.
+    def _compute_battery_stats(
+        self,
+        intro_diff: float,
+        control_diffs: List[float],
+    ) -> Dict[str, float]:
+        """Summarize the introspection logit-diff against the control battery.
+
+        z_score = (intro_diff - control_mean) / (control_std + eps)
+        percentile = fraction of control_diffs strictly below intro_diff.
+        If the control spread is degenerate (std ~ 0), z_score -> nan so we do
+        not mislead the reader with a spuriously large finite value.
+
+        Args:
+            intro_diff: Logit(Yes)-Logit(No) for the introspection question
+            control_diffs: Same quantity for each control question in the battery
 
         Returns:
-            Tuple of (introspection_diff, control_diff)
+            Dict with control_mean, control_std, z_score, percentile
+        """
+        arr = np.asarray(control_diffs, dtype=float)
+        mean = float(arr.mean())
+        std = float(arr.std(ddof=min(1, len(arr) - 1))) if len(arr) > 0 else 0.0
+        eps = 1e-6
+        if std < eps:
+            z = float("nan")
+        else:
+            z = float((intro_diff - mean) / std)
+        # Percentile rank: fraction of controls strictly below the intro value.
+        if len(arr) > 0:
+            below = float(np.sum(arr < intro_diff))
+            percentile = below / len(arr)
+        else:
+            percentile = float("nan")
+        return {
+            "control_mean": mean,
+            "control_std": std,
+            "z_score": z,
+            "percentile": percentile,
+        }
+
+    def _log_logits_summary(
+        self, label: str, top_logits, yes_no_diff: float
+    ) -> None:
+        """Pretty-print the top-k logits and Yes/No diff for a question."""
+        if not self.verbose:
+            return
+        print(f"    {label}: Logit(Yes) - Logit(No) = {yes_no_diff:+.3f}")
+        for i, (token_id, token_str, logit) in enumerate(top_logits, 1):
+            print(f"    {i:2d}. logit={logit:8.3f}  {repr(token_str)}")
+
+    def run_baseline(self) -> Dict:
+        """Run experiment without steering vector intervention.
+
+        Loops over the full control battery (feature #1) and returns summary
+        statistics so downstream callers can compare the introspection
+        logit-diff to the control distribution via z-score and percentile.
+
+        Returns:
+            Dict with keys: intro_diff, control_diffs (list), control_mean,
+            control_std, z_score, percentile
         """
         if self.verbose:
             print("\n=== Baseline ===")
 
-        # Test introspection question
+        # Introspection question
         if self.verbose:
             print("\n  Introspection question:")
         prompt_intro = self.format_prompt(self.introspection_question)
         inputs_intro = self.tokenizer(prompt_intro, return_tensors="pt").to(self.device)
         top_logits_intro, intro_diff = self.get_top_logits(inputs_intro, top_k=10)
+        self._log_logits_summary("intro", top_logits_intro, intro_diff)
 
+        # Control battery
+        control_diffs = []
+        for qi, question in enumerate(self.control_questions):
+            if self.verbose:
+                print(f"\n  Control question {qi+1}/{len(self.control_questions)}: {question}")
+            prompt_control = self.format_prompt(question)
+            inputs_control = self.tokenizer(prompt_control, return_tensors="pt").to(self.device)
+            top_logits_control, control_diff = self.get_top_logits(inputs_control, top_k=10)
+            self._log_logits_summary("control", top_logits_control, control_diff)
+            if self.verbose:
+                print(f"    {control_diff:+.3f}")
+            control_diffs.append(control_diff)
+
+        stats = self._compute_battery_stats(intro_diff, control_diffs)
         if self.verbose:
-            for i, (token_id, token_str, logit) in enumerate(top_logits_intro, 1):
-                print(f"    {i:2d}. logit={logit:8.3f}  {repr(token_str)}")
-            print(f"    Logit(Yes) - Logit(No) = {intro_diff:+.3f}")
+            print("\n  Baseline summary:")
+            print(f"    introspection diff = {intro_diff:+.3f}")
+            print(f"    control mean +/- std = {stats['control_mean']:+.3f} "
+                  f"+/- {stats['control_std']:.3f}")
+            print(f"    z_score = {stats['z_score'] if not np.isnan(stats['z_score']) else 'nan'}")
+            print(f"    percentile = {stats['percentile']:.2f}")
 
-        # Test control question
-        if self.verbose:
-            print("\n  Control question (1+1=3?):")
-        prompt_control = self.format_prompt(self.control_question)
-        inputs_control = self.tokenizer(prompt_control, return_tensors="pt").to(self.device)
-        top_logits_control, control_diff = self.get_top_logits(inputs_control, top_k=10)
-
-        if self.verbose:
-            for i, (token_id, token_str, logit) in enumerate(top_logits_control, 1):
-                print(f"    {i:2d}. logit={logit:8.3f}  {repr(token_str)}")
-            print(f"    Logit(Yes) - Logit(No) = {control_diff:+.3f}")
-
-        return intro_diff, control_diff
+        return {"intro_diff": intro_diff, "control_diffs": control_diffs, **stats}
 
     def run_with_steering(
         self,
@@ -456,33 +614,49 @@ class IntrospectionExperiment:
         magnitude: float = 1.0,
         token_pos: int = -1,
         contrastive_prompts: Tuple[str, str] = None,
-        steer_all_tokens: bool = False
-    ) -> Tuple[float, float]:
-        """Run experiment with steering vector injected at specified layer.
+        steer_all_tokens: bool = False,
+        random_vector: bool = False,
+        rng: Optional[torch.Generator] = None,
+    ) -> Dict:
+        """Run experiment with a steering vector injected at the specified layer.
+
+        Install one hook per call (covering the introspection question and the
+        whole control battery), then return summary statistics. Set
+        `random_vector=True` (feature #2) to inject a Gaussian vector of
+        matched norm instead of the contrastive diff -- this lets callers
+        obtain the random-vector baseline distribution.
 
         Args:
             layer_idx: Layer to inject steering vector
             magnitude: Scaling factor for steering vector
-            token_pos: Token position to inject at (-1 for last, 0 for first, etc.)
-            contrastive_prompts: Tuple of (prompt1, prompt2) for contrastive vector
+            token_pos: Token position to inject at (-1 for last, 0 for first)
+            contrastive_prompts: Tuple of (prompt1, prompt2) for contrastive
+                vector (or the norm-matching reference when random_vector=True)
             steer_all_tokens: If True, apply steering to all token positions
+            random_vector: If True, inject a norm-matched Gaussian instead of
+                the contrastive diff (random-vector baseline)
+            rng: torch.Generator for the random draw (default: self._rng)
 
         Returns:
-            Tuple of (introspection_diff, control_diff)
+            Dict with keys: intro_diff, control_diffs, control_mean,
+            control_std, z_score, percentile
         """
         if contrastive_prompts is None:
             raise ValueError("contrastive_prompts is required")
 
         if self.verbose:
             steer_mode = "all tokens" if steer_all_tokens else f"token pos {token_pos}"
-            print(f"\n=== Layer {layer_idx}, Contrastive, Scale {magnitude}, Steer {steer_mode} ===")
+            mode_label = "RANDOM" if random_vector else "Contrastive"
+            print(f"\n=== Layer {layer_idx}, {mode_label}, Scale {magnitude}, Steer {steer_mode} ===")
             print(f"  Prompt 1: {repr(contrastive_prompts[0][:50])}...")
             print(f"  Prompt 2: {repr(contrastive_prompts[1][:50])}...")
 
         steering_vector = self.generate_steering_vector(
             layer_idx, magnitude,
             contrastive_prompts=contrastive_prompts,
-            token_pos=token_pos
+            token_pos=token_pos,
+            random_vector=random_vector,
+            rng=rng,
         )
 
         def steering_hook(module, input, output):
@@ -506,31 +680,35 @@ class IntrospectionExperiment:
         hook_handle = self.layer_modules[layer_idx].register_forward_hook(steering_hook)
 
         try:
-            # Test introspection question
+            # Introspection question
             if self.verbose:
                 print("\n  Introspection question:")
             prompt_intro = self.format_prompt(self.introspection_question)
             inputs_intro = self.tokenizer(prompt_intro, return_tensors="pt").to(self.device)
             top_logits_intro, intro_diff = self.get_top_logits(inputs_intro, top_k=10)
+            self._log_logits_summary("intro", top_logits_intro, intro_diff)
 
+            # Control battery (one extra forward pass per question, same hook)
+            control_diffs = []
+            for qi, question in enumerate(self.control_questions):
+                if self.verbose:
+                    print(f"\n  Control question {qi+1}/{len(self.control_questions)}:")
+                prompt_control = self.format_prompt(question)
+                inputs_control = self.tokenizer(prompt_control, return_tensors="pt").to(self.device)
+                top_logits_control, control_diff = self.get_top_logits(inputs_control, top_k=10)
+                self._log_logits_summary("control", top_logits_control, control_diff)
+                control_diffs.append(control_diff)
+
+            stats = self._compute_battery_stats(intro_diff, control_diffs)
             if self.verbose:
-                for i, (token_id, token_str, logit) in enumerate(top_logits_intro, 1):
-                    print(f"    {i:2d}. logit={logit:8.3f}  {repr(token_str)}")
-                print(f"    Logit(Yes) - Logit(No) = {intro_diff:+.3f}")
+                print("\n  Steering summary:")
+                print(f"    introspection diff = {intro_diff:+.3f}")
+                print(f"    control mean +/- std = {stats['control_mean']:+.3f} "
+                      f"+/- {stats['control_std']:.3f}")
+                print(f"    z_score = {stats['z_score'] if not np.isnan(stats['z_score']) else 'nan'}")
+                print(f"    percentile = {stats['percentile']:.2f}")
 
-            # Test control question
-            if self.verbose:
-                print("\n  Control question (1+1=3?):")
-            prompt_control = self.format_prompt(self.control_question)
-            inputs_control = self.tokenizer(prompt_control, return_tensors="pt").to(self.device)
-            top_logits_control, control_diff = self.get_top_logits(inputs_control, top_k=10)
-
-            if self.verbose:
-                for i, (token_id, token_str, logit) in enumerate(top_logits_control, 1):
-                    print(f"    {i:2d}. logit={logit:8.3f}  {repr(token_str)}")
-                print(f"    Logit(Yes) - Logit(No) = {control_diff:+.3f}")
-
-            return intro_diff, control_diff
+            return {"intro_diff": intro_diff, "control_diffs": control_diffs, **stats}
         finally:
             hook_handle.remove()
 
@@ -542,21 +720,31 @@ class IntrospectionExperiment:
         token_pos: int = -1,
         contrastive_prompts: Tuple[str, str] = None,
         plot: bool = False,
-        steer_all_tokens: bool = False
+        steer_all_tokens: bool = False,
+        random_baseline: bool = False,
+        num_random_seeds: int = DEFAULT_NUM_RANDOM_SEEDS,
     ):
         """Run complete experiment across specified layers.
+
+        Per layer, returns introspection logit-diff plus the control battery
+        distribution (feature #1) and, if requested, the random-vector
+        baseline distribution matched in norm (feature #2).
 
         Args:
             layers: Layer indices to test (default: all layers)
             magnitude: Scaling factor for steering vector
-            num_trials: Number of trials per condition
+            num_trials: Number of trials per condition (contrastive)
             token_pos: Token position to inject at (-1 for last, 0 for first, etc.)
             contrastive_prompts: Tuple of (prompt1, prompt2) for contrastive vector
             plot: Whether to generate a plot of logit difference vs layer
             steer_all_tokens: If True, apply steering to all token positions
+            random_baseline: If True, also run N random-vector seeds per layer
+            num_random_seeds: Number of random vectors to average for the baseline
 
         Returns:
-            List of result dictionaries
+            List of result dictionaries (one per layer), augmented with
+            baseline stats. A dict 'baseline' with the same fields is the
+            first entry.
         """
         num_layers = len(self.layer_modules)
 
@@ -568,6 +756,9 @@ class IntrospectionExperiment:
             print(f"Hidden size: {self.model.config.hidden_size}")
             print(f"Layers: {num_layers}, Testing: {layers}, Scale: {magnitude}, Trials: {num_trials}")
             print(f"Token pos: {token_pos}")
+            print(f"Control battery: {len(self.control_questions)} questions")
+            print(f"Random baseline: {'ON' if random_baseline else 'OFF'}"
+                  + (f", {num_random_seeds} seeds" if random_baseline else ""))
             print(f"Contrastive mode: '{contrastive_prompts[0][:30]}...' vs '{contrastive_prompts[1][:30]}...'")
             print()
         else:
@@ -576,7 +767,7 @@ class IntrospectionExperiment:
         # Baseline
         if not self.verbose:
             print("Computing baseline...")
-        baseline_intro, baseline_control = self.run_baseline()
+        baseline = self.run_baseline()
 
         # Track results for plotting
         layer_results = []
@@ -587,34 +778,70 @@ class IntrospectionExperiment:
                 continue
 
             trial_intro_diffs = []
-            trial_control_diffs = []
+            trial_control_means = []
+            trial_control_stds = []
+            trial_z_scores = []
+            trial_percentiles = []
             for trial in range(num_trials):
                 if num_trials > 1 and self.verbose:
                     print(f"[Trial {trial + 1}/{num_trials}]")
                 elif not self.verbose:
                     print(f"Progress: Layer {layer_idx}/{layers[-1]}, Trial {trial+1}/{num_trials}")
-                intro_diff, control_diff = self.run_with_steering(
-                    layer_idx, magnitude, token_pos, contrastive_prompts, steer_all_tokens
+                res = self.run_with_steering(
+                    layer_idx, magnitude, token_pos, contrastive_prompts,
+                    steer_all_tokens
                 )
-                trial_intro_diffs.append(intro_diff)
-                trial_control_diffs.append(control_diff)
+                trial_intro_diffs.append(res["intro_diff"])
+                trial_control_means.append(res["control_mean"])
+                trial_control_stds.append(res["control_std"])
+                trial_z_scores.append(res["z_score"])
+                trial_percentiles.append(res["percentile"])
 
-            # Store average across trials
-            avg_intro_diff = np.mean(trial_intro_diffs)
-            avg_control_diff = np.mean(trial_control_diffs)
-            layer_results.append({
-                'layer': layer_idx,
-                'intro_diff': avg_intro_diff,
-                'control_diff': avg_control_diff,
-                'all_intro_diffs': trial_intro_diffs,
-                'all_control_diffs': trial_control_diffs
-            })
+            entry = {
+                "layer": layer_idx,
+                "intro_diff": float(np.mean(trial_intro_diffs)),
+                "control_diff": float(np.mean(trial_control_means)),
+                "control_mean": float(np.mean(trial_control_means)),
+                "control_std": float(np.mean(trial_control_stds)),
+                "z_score": float(np.nanmean(trial_z_scores)),
+                "percentile": float(np.nanmean(trial_percentiles)),
+                "all_intro_diffs": trial_intro_diffs,
+                "all_control_means": trial_control_means,
+                "all_control_stds": trial_control_stds,
+            }
+
+            # Random-vector baseline (feature #2)
+            if random_baseline:
+                rand_intro_diffs = []
+                rand_control_means = []
+                rand_control_stds = []
+                for seed_idx in range(num_random_seeds):
+                    # Use a fresh child generator per seed for reproducibility.
+                    child_seed = self.seed + 1000 * seed_idx + layer_idx + 1
+                    child_rng = torch.Generator(device=self.device).manual_seed(child_seed)
+                    if self.verbose:
+                        print(f"[Random seed {seed_idx+1}/{num_random_seeds}]")
+                    res = self.run_with_steering(
+                        layer_idx, magnitude, token_pos, contrastive_prompts,
+                        steer_all_tokens,
+                        random_vector=True, rng=child_rng,
+                    )
+                    rand_intro_diffs.append(res["intro_diff"])
+                    rand_control_means.append(res["control_mean"])
+                    rand_control_stds.append(res["control_std"])
+                entry["random_intro_diff"] = float(np.mean(rand_intro_diffs))
+                entry["random_intro_std"] = float(np.std(rand_intro_diffs)) if len(rand_intro_diffs) > 1 else 0.0
+                entry["random_control_mean"] = float(np.mean(rand_control_means))
+                entry["random_control_std"] = float(np.mean(rand_control_stds))
+                entry["all_random_intro_diffs"] = rand_intro_diffs
+
+            layer_results.append(entry)
 
         # Generate plot if requested
         if plot:
             self._plot_layer_effects(
-                layer_results, baseline_intro, baseline_control,
-                magnitude, contrastive_prompts
+                layer_results, baseline, magnitude,
+                contrastive_prompts, random_baseline=random_baseline,
             )
 
         return layer_results
@@ -627,18 +854,26 @@ class IntrospectionExperiment:
         token_pos: int = -1,
         contrastive_prompts: Tuple[str, str] = None,
         plot: bool = False,
-        steer_all_tokens: bool = False
+        steer_all_tokens: bool = False,
+        random_baseline: bool = False,
+        num_random_seeds: int = DEFAULT_NUM_RANDOM_SEEDS,
     ):
         """Run experiment sweeping over different steering vector scales at a single layer.
+
+        For each scale, returns the introspection logit-diff plus the control
+        battery distribution (feature #1) and, if requested, the random-vector
+        baseline (feature #2) averaged over `num_random_seeds` draws.
 
         Args:
             layer_idx: Layer index to inject steering at
             scales: List of scale values to test
-            num_trials: Number of trials per scale
+            num_trials: Number of trials per scale (contrastive)
             token_pos: Token position to inject at (-1 for last, 0 for first, etc.)
             contrastive_prompts: Tuple of (prompt1, prompt2) for contrastive vector
             plot: Whether to generate a plot of logit difference vs scale
             steer_all_tokens: If True, apply steering to all token positions
+            random_baseline: If True, also run N random-vector seeds per scale
+            num_random_seeds: Number of random vectors to average for the baseline
 
         Returns:
             List of result dictionaries
@@ -648,6 +883,9 @@ class IntrospectionExperiment:
             print(f"Hidden size: {self.model.config.hidden_size}")
             print(f"Testing layer {layer_idx} with scales: {scales}")
             print(f"Trials per scale: {num_trials}, Token pos: {token_pos}")
+            print(f"Control battery: {len(self.control_questions)} questions")
+            print(f"Random baseline: {'ON' if random_baseline else 'OFF'}"
+                  + (f", {num_random_seeds} seeds" if random_baseline else ""))
             print(f"Contrastive mode: '{contrastive_prompts[0][:30]}...' vs '{contrastive_prompts[1][:30]}...'")
             print()
         else:
@@ -656,7 +894,7 @@ class IntrospectionExperiment:
         # Baseline (scale = 0)
         if not self.verbose:
             print("Computing baseline...")
-        baseline_intro, baseline_control = self.run_baseline()
+        baseline = self.run_baseline()
 
         # Track results for plotting
         scale_results = []
@@ -670,55 +908,162 @@ class IntrospectionExperiment:
 
             # Special case: scale=0 is just the baseline
             if scale == 0:
-                scale_results.append({
-                    'scale': scale,
-                    'intro_diff': baseline_intro,
-                    'control_diff': baseline_control,
-                    'all_intro_diffs': [baseline_intro] * num_trials,
-                    'all_control_diffs': [baseline_control] * num_trials
-                })
+                entry = {
+                    "scale": scale,
+                    "intro_diff": baseline["intro_diff"],
+                    "control_diff": baseline["control_mean"],
+                    "control_mean": baseline["control_mean"],
+                    "control_std": baseline["control_std"],
+                    "z_score": baseline["z_score"],
+                    "percentile": baseline["percentile"],
+                    "all_intro_diffs": [baseline["intro_diff"]] * num_trials,
+                    "all_control_means": [baseline["control_mean"]] * num_trials,
+                    "all_control_stds": [baseline["control_std"]] * num_trials,
+                }
                 if self.verbose:
                     print(f"  Using baseline (no steering)")
-                    print(f"  Introspection: {baseline_intro:+.3f}")
-                    print(f"  Control: {baseline_control:+.3f}")
+                    print(f"  Introspection: {entry['intro_diff']:+.3f}")
+                    print(f"  Control mean: {entry['control_mean']:+.3f} +/- {entry['control_std']:.3f}")
+                    print(f"  z_score: {entry['z_score']}")
+                scale_results.append(entry)
                 continue
 
             trial_intro_diffs = []
-            trial_control_diffs = []
+            trial_control_means = []
+            trial_control_stds = []
+            trial_z_scores = []
+            trial_percentiles = []
             for trial in range(num_trials):
                 if num_trials > 1 and self.verbose:
                     print(f"[Trial {trial + 1}/{num_trials}]")
-                intro_diff, control_diff = self.run_with_steering(
+                res = self.run_with_steering(
                     layer_idx, scale, token_pos, contrastive_prompts, steer_all_tokens
                 )
-                trial_intro_diffs.append(intro_diff)
-                trial_control_diffs.append(control_diff)
+                trial_intro_diffs.append(res["intro_diff"])
+                trial_control_means.append(res["control_mean"])
+                trial_control_stds.append(res["control_std"])
+                trial_z_scores.append(res["z_score"])
+                trial_percentiles.append(res["percentile"])
 
-            # Store average across trials
-            avg_intro_diff = np.mean(trial_intro_diffs)
-            avg_control_diff = np.mean(trial_control_diffs)
+            entry = {
+                "scale": scale,
+                "intro_diff": float(np.mean(trial_intro_diffs)),
+                "control_diff": float(np.mean(trial_control_means)),
+                "control_mean": float(np.mean(trial_control_means)),
+                "control_std": float(np.mean(trial_control_stds)),
+                "z_score": float(np.nanmean(trial_z_scores)),
+                "percentile": float(np.nanmean(trial_percentiles)),
+                "all_intro_diffs": trial_intro_diffs,
+                "all_control_means": trial_control_means,
+                "all_control_stds": trial_control_stds,
+            }
 
-            scale_results.append({
-                'scale': scale,
-                'intro_diff': avg_intro_diff,
-                'control_diff': avg_control_diff,
-                'all_intro_diffs': trial_intro_diffs,
-                'all_control_diffs': trial_control_diffs
-            })
+            # Random-vector baseline (feature #2)
+            if random_baseline:
+                rand_intro_diffs = []
+                rand_control_means = []
+                for seed_idx in range(num_random_seeds):
+                    child_seed = self.seed + 1000 * seed_idx + int(scale * 10) + 1
+                    child_rng = torch.Generator(device=self.device).manual_seed(child_seed)
+                    if self.verbose:
+                        print(f"[Random seed {seed_idx+1}/{num_random_seeds}]")
+                    res = self.run_with_steering(
+                        layer_idx, scale, token_pos, contrastive_prompts,
+                        steer_all_tokens, random_vector=True, rng=child_rng,
+                    )
+                    rand_intro_diffs.append(res["intro_diff"])
+                    rand_control_means.append(res["control_mean"])
+                entry["random_intro_diff"] = float(np.mean(rand_intro_diffs))
+                entry["random_intro_std"] = float(np.std(rand_intro_diffs)) if len(rand_intro_diffs) > 1 else 0.0
+                entry["random_control_mean"] = float(np.mean(rand_control_means))
+                entry["all_random_intro_diffs"] = rand_intro_diffs
+
+            scale_results.append(entry)
 
             if self.verbose:
                 print(f"\nAverage across {num_trials} trial(s):")
-                print(f"  Introspection: {avg_intro_diff:+.3f}")
-                print(f"  Control: {avg_control_diff:+.3f}")
+                print(f"  Introspection: {entry['intro_diff']:+.3f}")
+                print(f"  Control mean: {entry['control_mean']:+.3f} +/- {entry['control_std']:.3f}")
+                print(f"  z_score: {entry['z_score']}")
+                if random_baseline:
+                    print(f"  Random introspection: {entry['random_intro_diff']:+.3f} +/- {entry['random_intro_std']:.3f}")
 
         # Generate plot if requested
         if plot:
             self._plot_scale_effects(
-                scale_results, baseline_intro, baseline_control,
-                layer_idx, contrastive_prompts
+                scale_results, baseline, layer_idx,
+                contrastive_prompts, random_baseline=random_baseline,
             )
 
         return scale_results
+
+    def _synthesize_layer_results_from_heatmap(
+        self,
+        intro_matrix: np.ndarray,
+        control_mean_matrix: np.ndarray,
+        control_std_matrix: np.ndarray,
+        z_matrix: np.ndarray,
+        layers: List[int],
+        scale_idx: int,
+        random_intro_matrix: Optional[np.ndarray] = None,
+    ) -> List[Dict]:
+        """Slice one column (fixed scale) of the heatmap matrices into the
+        list-of-dicts shape that _plot_layer_effects expects.
+
+        No forward passes: all data is already in the matrices.
+        """
+        results = []
+        for li, layer in enumerate(layers):
+            entry = {
+                "layer": layer,
+                "intro_diff": float(intro_matrix[li, scale_idx]),
+                "control_mean": float(control_mean_matrix[li, scale_idx]),
+                "control_std": float(control_std_matrix[li, scale_idx]),
+                "control_diff": float(control_mean_matrix[li, scale_idx]),
+                "z_score": float(z_matrix[li, scale_idx]),
+                "all_intro_diffs": [float(intro_matrix[li, scale_idx])],
+                "all_control_means": [float(control_mean_matrix[li, scale_idx])],
+                "all_control_stds": [float(control_std_matrix[li, scale_idx])],
+            }
+            if random_intro_matrix is not None:
+                entry["random_intro_diff"] = float(random_intro_matrix[li, scale_idx])
+                entry["random_intro_std"] = 0.0
+            results.append(entry)
+        return results
+
+    def _synthesize_scale_results_from_heatmap(
+        self,
+        intro_matrix: np.ndarray,
+        control_mean_matrix: np.ndarray,
+        control_std_matrix: np.ndarray,
+        z_matrix: np.ndarray,
+        scales: List[float],
+        layer_idx_pos: int,
+        random_intro_matrix: Optional[np.ndarray] = None,
+    ) -> List[Dict]:
+        """Slice one row (fixed layer) of the heatmap matrices into the
+        list-of-dicts shape that _plot_scale_effects expects.
+
+        No forward passes: all data is already in the matrices.
+        """
+        results = []
+        for si, scale in enumerate(scales):
+            entry = {
+                "scale": scale,
+                "intro_diff": float(intro_matrix[layer_idx_pos, si]),
+                "control_mean": float(control_mean_matrix[layer_idx_pos, si]),
+                "control_std": float(control_std_matrix[layer_idx_pos, si]),
+                "control_diff": float(control_mean_matrix[layer_idx_pos, si]),
+                "z_score": float(z_matrix[layer_idx_pos, si]),
+                "all_intro_diffs": [float(intro_matrix[layer_idx_pos, si])],
+                "all_control_means": [float(control_mean_matrix[layer_idx_pos, si])],
+                "all_control_stds": [float(control_std_matrix[layer_idx_pos, si])],
+            }
+            if random_intro_matrix is not None:
+                entry["random_intro_diff"] = float(random_intro_matrix[layer_idx_pos, si])
+                entry["random_intro_std"] = 0.0
+            results.append(entry)
+        return results
 
     def run_heatmap_sweep(
         self,
@@ -726,9 +1071,21 @@ class IntrospectionExperiment:
         scales: Optional[List[float]] = None,
         token_pos: int = -1,
         contrastive_prompts: Tuple[str, str] = None,
-        steer_all_tokens: bool = False
+        steer_all_tokens: bool = False,
+        random_baseline: bool = False,
+        num_random_seeds: int = DEFAULT_NUM_RANDOM_SEEDS,
+        line_plots: bool = True,
+        line_plot_layer: Optional[int] = None,
+        line_plot_scale: Optional[float] = None,
     ):
         """Run experiment sweeping over both layers and scales, generating heatmaps.
+
+        Produces heatmaps for introspection, control-battery mean, and
+        z-score (feature #1), plus an optional random-vector introspection
+        heatmap (feature #2). When line_plots=True, also emits a scale-sweep
+        line plot (at a chosen layer) and a layer-sweep line plot (at a chosen
+        scale), reusing the already-computed matrix data -- no extra forward
+        passes.
 
         Args:
             layers: Layer indices to test (default: all layers)
@@ -736,6 +1093,13 @@ class IntrospectionExperiment:
             token_pos: Token position to inject at (-1 for last)
             contrastive_prompts: Tuple of (prompt1, prompt2) for contrastive vector
             steer_all_tokens: If True, apply steering to all token positions
+            random_baseline: If True, also run N random-vector seeds per condition
+            num_random_seeds: Number of random vectors to average for the baseline
+            line_plots: If True (default), also generate two line plots by slicing
+                the heatmap matrices (free -- no extra forward passes)
+            line_plot_layer: Layer for the scale-sweep line plot (default: middle)
+            line_plot_scale: Scale for the layer-sweep line plot (default: max
+                non-zero scale, where introspection effects are clearest)
 
         Returns:
             Dictionary with results and metadata
@@ -757,6 +1121,9 @@ class IntrospectionExperiment:
             print(f"Layers: {layers}")
             print(f"Scales: {scales}")
             print(f"Token pos: {token_pos}")
+            print(f"Control battery: {len(self.control_questions)} questions")
+            print(f"Random baseline: {'ON' if random_baseline else 'OFF'}"
+                  + (f", {num_random_seeds} seeds" if random_baseline else ""))
             print(f"Contrastive mode: '{contrastive_prompts[0][:30]}...' vs '{contrastive_prompts[1][:30]}...'")
             print()
         else:
@@ -765,11 +1132,17 @@ class IntrospectionExperiment:
         # Get baseline
         if not self.verbose:
             print("Computing baseline...")
-        baseline_intro, baseline_control = self.run_baseline()
+        baseline = self.run_baseline()
 
         # Initialize result matrices
         intro_matrix = np.zeros((len(layers), len(scales)))
-        control_matrix = np.zeros((len(layers), len(scales)))
+        control_mean_matrix = np.zeros((len(layers), len(scales)))
+        control_std_matrix = np.zeros((len(layers), len(scales)))
+        z_matrix = np.full((len(layers), len(scales)), np.nan)
+
+        random_intro_matrix = None
+        if random_baseline:
+            random_intro_matrix = np.zeros((len(layers), len(scales)))
 
         # Iterate over all combinations
         condition_num = 0
@@ -785,34 +1158,113 @@ class IntrospectionExperiment:
 
                 # Special case: scale=0 is just baseline (no steering)
                 if scale == 0:
-                    intro_diff = baseline_intro
-                    control_diff = baseline_control
+                    intro_diff = baseline["intro_diff"]
+                    control_mean = baseline["control_mean"]
+                    control_std = baseline["control_std"]
+                    z_val = baseline["z_score"]
                     if self.verbose:
                         print(f"  Using baseline (no steering)")
                         print(f"  Introspection: {intro_diff:+.3f}")
-                        print(f"  Control: {control_diff:+.3f}")
+                        print(f"  Control mean: {control_mean:+.3f} +/- {control_std:.3f}")
+                        print(f"  z_score: {z_val}")
                 else:
-                    intro_diff, control_diff = self.run_with_steering(
+                    res = self.run_with_steering(
                         layer_idx, scale, token_pos, contrastive_prompts, steer_all_tokens
                     )
+                    intro_diff = res["intro_diff"]
+                    control_mean = res["control_mean"]
+                    control_std = res["control_std"]
+                    z_val = res["z_score"]
 
                 # Store results
                 intro_matrix[layer_idx_pos, scale_idx] = intro_diff
-                control_matrix[layer_idx_pos, scale_idx] = control_diff
+                control_mean_matrix[layer_idx_pos, scale_idx] = control_mean
+                control_std_matrix[layer_idx_pos, scale_idx] = control_std
+                z_matrix[layer_idx_pos, scale_idx] = z_val
+
+                if random_baseline and scale != 0:
+                    rand_intro_diffs = []
+                    for seed_idx in range(num_random_seeds):
+                        child_seed = self.seed + 1000 * seed_idx + 100 * layer_idx + int(scale * 10) + 1
+                        child_rng = torch.Generator(device=self.device).manual_seed(child_seed)
+                        if self.verbose:
+                            print(f"[Random seed {seed_idx+1}/{num_random_seeds}]")
+                        r_res = self.run_with_steering(
+                            layer_idx, scale, token_pos, contrastive_prompts,
+                            steer_all_tokens, random_vector=True, rng=child_rng,
+                        )
+                        rand_intro_diffs.append(r_res["intro_diff"])
+                    random_intro_matrix[layer_idx_pos, scale_idx] = float(np.mean(rand_intro_diffs))
+                elif random_baseline:
+                    random_intro_matrix[layer_idx_pos, scale_idx] = baseline["intro_diff"]
 
         # Generate heatmaps
         self._plot_heatmaps(
-            intro_matrix, control_matrix, layers, scales,
-            baseline_intro, baseline_control, contrastive_prompts
+            intro_matrix, control_mean_matrix, control_std_matrix, z_matrix,
+            layers, scales, baseline, contrastive_prompts,
+            random_intro_matrix=random_intro_matrix,
         )
 
+        # Also generate line plots by slicing the matrices (free -- no extra
+        # forward passes). This gives the same data in a more readable form:
+        #   - a scale-sweep line plot at a chosen layer (control band + z twin axis)
+        #   - a layer-sweep line plot at a chosen scale (control band + z twin axis)
+        if line_plots:
+            # Pick the middle layer for the scale-sweep line plot
+            mid_layer_pos = len(layers) // 2
+            if line_plot_layer is not None:
+                mid_layer_pos = min(
+                    range(len(layers)),
+                    key=lambda i: abs(layers[i] - line_plot_layer),
+                )
+            mid_layer_idx = layers[mid_layer_pos]
+
+            print(f"\n[Generating scale-sweep line plot at layer {mid_layer_idx}]")
+            scale_results = self._synthesize_scale_results_from_heatmap(
+                intro_matrix, control_mean_matrix, control_std_matrix, z_matrix,
+                scales, mid_layer_pos, random_intro_matrix,
+            )
+            self._plot_scale_effects(
+                scale_results, baseline, mid_layer_idx,
+                contrastive_prompts, random_baseline=random_baseline,
+            )
+
+            # Pick the max non-zero scale for the layer-sweep line plot
+            # (where introspection effects are clearest)
+            nz_scales = [(si, s) for si, s in enumerate(scales) if s != 0]
+            if not nz_scales:
+                target_scale_idx = len(scales) - 1
+            elif line_plot_scale is not None:
+                target_scale_idx = min(
+                    range(len(scales)),
+                    key=lambda i: abs(scales[i] - line_plot_scale),
+                )
+            else:
+                target_scale_idx = max(nz_scales, key=lambda x: x[1])[0]
+            target_scale = scales[target_scale_idx]
+
+            print(f"\n[Generating layer-sweep line plot at scale {target_scale}]")
+            layer_results = self._synthesize_layer_results_from_heatmap(
+                intro_matrix, control_mean_matrix, control_std_matrix, z_matrix,
+                layers, target_scale_idx, random_intro_matrix,
+            )
+            self._plot_layer_effects(
+                layer_results, baseline, target_scale,
+                contrastive_prompts, random_baseline=random_baseline,
+            )
+
         return {
-            'layers': layers,
-            'scales': scales,
-            'intro_matrix': intro_matrix,
-            'control_matrix': control_matrix,
-            'baseline_intro': baseline_intro,
-            'baseline_control': baseline_control
+            "layers": layers,
+            "scales": scales,
+            "intro_matrix": intro_matrix,
+            "control_matrix": control_mean_matrix,            # legacy alias
+            "control_mean_matrix": control_mean_matrix,
+            "control_std_matrix": control_std_matrix,
+            "z_matrix": z_matrix,
+            "baseline": baseline,
+            "baseline_intro": baseline["intro_diff"],         # legacy alias
+            "baseline_control": baseline["control_mean"],     # legacy alias
+            "random_intro_matrix": random_intro_matrix,
         }
 
     def run_generation_experiment(
@@ -906,74 +1358,114 @@ class IntrospectionExperiment:
     def _plot_layer_effects(
         self,
         layer_results: List[Dict],
-        baseline_intro: float,
-        baseline_control: float,
+        baseline: Dict,
         magnitude: float,
-        contrastive_prompts: Tuple[str, str]
+        contrastive_prompts: Tuple[str, str],
+        random_baseline: bool = False,
     ):
-        """Plot logit difference as a function of layer position for both questions.
+        """Plot logit difference vs layer, with control battery band + z-score.
+
+        Left axis: introspection logit-diff, control battery mean +/- std
+        (shaded), and optional random-vector baseline band (feature #2).
+        Right axis (twin): z-score of introspection against the control
+        battery (feature #1). z ~= 0 means pure confusion; large |z| means
+        introspection deviates specifically from the control distribution.
 
         Args:
-            layer_results: List of dicts with 'layer', 'intro_diff', 'control_diff' keys
-            baseline_intro: Baseline introspection logit difference
-            baseline_control: Baseline control logit difference
+            layer_results: List of per-layer result dicts
+            baseline: Baseline stats dict (from run_baseline)
             magnitude: Magnitude used for steering
-            contrastive_prompts: Tuple of (prompt1, prompt2) for contrastive vector
+            contrastive_prompts: Tuple of (prompt1, prompt2) for plot title
+            random_baseline: Whether to overlay the random-vector band
         """
         layers = [r['layer'] for r in layer_results]
         intro_diffs = [r['intro_diff'] for r in layer_results]
-        control_diffs = [r['control_diff'] for r in layer_results]
+        control_means = [r['control_mean'] for r in layer_results]
+        control_stds = [r['control_std'] for r in layer_results]
+        z_scores = np.array([r['z_score'] for r in layer_results], dtype=float)
+        baseline_intro = baseline["intro_diff"]
+        baseline_control_mean = baseline["control_mean"]
+        baseline_control_std = baseline["control_std"]
 
-        fig = plt.figure(figsize=(14, 9))
-        ax = plt.subplot(111)
+        fig, ax = plt.subplots(figsize=(15, 9))
+        ax_z = ax.twinx()  # twin axis for z-score (feature #1)
 
-        # Plot baselines
-        plt.axhline(y=baseline_intro, color='blue', linestyle='--', linewidth=1.5, alpha=0.5,
+        # Baseline references
+        ax.axhline(y=baseline_intro, color='blue', linestyle='--', linewidth=1.5, alpha=0.5,
                    label=f'Baseline introspection: {baseline_intro:+.2f}')
-        plt.axhline(y=baseline_control, color='red', linestyle='--', linewidth=1.5, alpha=0.5,
-                   label=f'Baseline control: {baseline_control:+.2f}')
+        ax.axhline(y=baseline_control_mean, color='red', linestyle='--', linewidth=1.5, alpha=0.5,
+                   label=f'Baseline control mean: {baseline_control_mean:+.2f}')
 
-        # Plot introspection question (experimental)
-        plt.plot(layers, intro_diffs, 'o-', linewidth=2, markersize=5, color='blue',
-                label=f'Introspection question')
+        # Control battery band: mean +/- std (feature #1)
+        ctrl_means_arr = np.asarray(control_means)
+        ctrl_stds_arr = np.asarray(control_stds)
+        ax.fill_between(
+            layers, ctrl_means_arr - ctrl_stds_arr, ctrl_means_arr + ctrl_stds_arr,
+            color='red', alpha=0.18, label='Control battery band (+/- std)',
+        )
+        ax.plot(layers, control_means, 's-', linewidth=1.8, markersize=5, color='red',
+                label='Control battery mean')
 
-        # Plot control question (sanity check)
-        plt.plot(layers, control_diffs, 's-', linewidth=2, markersize=5, color='red',
-                label=f'Control question')
+        # Optional random-vector baseline band (feature #2)
+        if random_baseline and 'random_intro_diff' in layer_results[0]:
+            rand_intro = [r['random_intro_diff'] for r in layer_results]
+            rand_std = [r['random_intro_std'] for r in layer_results]
+            rand_arr = np.asarray(rand_intro)
+            rand_std_arr = np.asarray(rand_std)
+            ax.fill_between(
+                layers, rand_arr - rand_std_arr, rand_arr + rand_std_arr,
+                color='gray', alpha=0.18, label='Random-vector baseline band',
+            )
+            ax.plot(layers, rand_intro, '^-', linewidth=1.5, markersize=5, color='gray',
+                    label='Random-vector baseline')
 
-        # If multiple trials, show error bars
+        # Introspection
+        ax.plot(layers, intro_diffs, 'o-', linewidth=2, markersize=5, color='blue',
+                label='Introspection question')
+
+        # Multi-trial error bars (intro)
         if len(layer_results[0]['all_intro_diffs']) > 1:
             intro_stds = [np.std(r['all_intro_diffs']) for r in layer_results]
-            control_stds = [np.std(r['all_control_diffs']) for r in layer_results]
-            plt.errorbar(layers, intro_diffs, yerr=intro_stds, fmt='none', ecolor='blue',
+            ax.errorbar(layers, intro_diffs, yerr=intro_stds, fmt='none', ecolor='blue',
                         capsize=4, alpha=0.4)
-            plt.errorbar(layers, control_diffs, yerr=control_stds, fmt='none', ecolor='red',
-                        capsize=4, alpha=0.4)
+
+        # z-score on twin axis (feature #1)
+        ax_z.plot(layers, z_scores, 'd--', linewidth=1.2, markersize=5, color='purple',
+                  alpha=0.85, label='z-score (intro vs battery)')
+        ax_z.axhline(y=0, color='purple', linestyle=':', linewidth=1, alpha=0.5)
+        ax_z.set_ylabel('z-score (introspection vs control battery)', fontsize=11, color='purple')
+        ax_z.tick_params(axis='y', labelcolor='purple')
 
         # Styling
-        plt.xlabel('Layer Index', fontsize=13)
-        plt.ylabel('Logit(Yes) - Logit(No)', fontsize=13)
+        ax.set_xlabel('Layer Index', fontsize=13)
+        ax.set_ylabel('Logit(Yes) - Logit(No)', fontsize=13)
 
-        # Build title with model and steering info
         model_display = self.model_name.split("/")[-1]
         steering_info = f'Contrastive Steering: "{contrastive_prompts[0]}" vs "{contrastive_prompts[1]}" (strength={magnitude})'
+        ax.set_title(f'LLM Introspection Experiment: {model_display}\n{steering_info}',
+                     fontsize=13, fontweight='bold', pad=20)
 
-        plt.title(f'LLM Introspection Experiment: {model_display}\n{steering_info}',
-                 fontsize=13, fontweight='bold', pad=20)
+        ax.grid(True, alpha=0.3)
+        ax.axhline(y=0, color='black', linestyle=':', linewidth=1, alpha=0.5)
 
-        plt.grid(True, alpha=0.3)
-        plt.legend(fontsize=10, loc='best')
-        plt.axhline(y=0, color='black', linestyle=':', linewidth=1, alpha=0.5)
-
-        # Add shaded region for "detects anomaly" (positive values)
-        y_min, y_max = plt.ylim()
+        y_min, y_max = ax.get_ylim()
         if y_max > 0:
-            plt.axhspan(0, y_max, alpha=0.05, color='green')
+            ax.axhspan(0, y_max, alpha=0.05, color='green')
         if y_min < 0:
-            plt.axhspan(y_min, 0, alpha=0.05, color='orange')
+            ax.axhspan(y_min, 0, alpha=0.05, color='orange')
 
-        # Add text box with questions
-        textstr = f'Introspection: "{self.introspection_question}"\n\nControl: "{self.control_question}"'
+        # Combined legend across both axes
+        h1, l1 = ax.get_legend_handles_labels()
+        h2, l2 = ax_z.get_legend_handles_labels()
+        ax.legend(h1 + h2, l1 + l2, fontsize=9, loc='best')
+
+        # Info text box
+        n_controls = len(baseline.get("control_diffs", []) or self.control_questions)
+        textstr = (
+            f'Introspection: "{self.introspection_question}"\n\n'
+            f'Control battery: {n_controls} questions (all "No"-expected)\n'
+            f'First control: "{self.control_questions[0]}"'
+        )
         props = dict(boxstyle='round', facecolor='wheat', alpha=0.3)
         ax.text(0.02, 0.98, textstr, transform=ax.transAxes, fontsize=9,
                 verticalalignment='top', bbox=props, family='monospace')
@@ -982,7 +1474,10 @@ class IntrospectionExperiment:
 
         # Save plot
         model_short = self.model_name.split("/")[-1].replace(".", "_")
-        filename = f"introspection_{model_short}_contrastive_scale{magnitude}.png"
+        suffix = "_battery"
+        if random_baseline:
+            suffix += "_random"
+        filename = f"introspection_{model_short}_contrastive_scale{magnitude}{suffix}.png"
         plt.savefig(filename, dpi=150, bbox_inches='tight')
         print(f"\n[Plot saved to: {filename}]")
         plt.show()
@@ -990,74 +1485,109 @@ class IntrospectionExperiment:
     def _plot_scale_effects(
         self,
         scale_results: List[Dict],
-        baseline_intro: float,
-        baseline_control: float,
+        baseline: Dict,
         layer_idx: int,
-        contrastive_prompts: Tuple[str, str]
+        contrastive_prompts: Tuple[str, str],
+        random_baseline: bool = False,
     ):
-        """Plot logit difference vs steering vector scale for both questions.
+        """Plot logit difference vs scale, with control band + z-score.
+
+        Mirrors _plot_layer_effects but along the scale axis at one layer.
 
         Args:
-            scale_results: List of dicts with 'scale', 'intro_diff', 'control_diff' keys
-            baseline_intro: Baseline introspection logit difference
-            baseline_control: Baseline control logit difference
+            scale_results: List of per-scale result dicts
+            baseline: Baseline stats dict (from run_baseline)
             layer_idx: Layer index where steering was applied
-            contrastive_prompts: Tuple of (prompt1, prompt2) for contrastive vector
+            contrastive_prompts: Tuple of (prompt1, prompt2) for the title
+            random_baseline: Whether to overlay the random-vector band
         """
         scales = [r['scale'] for r in scale_results]
         intro_diffs = [r['intro_diff'] for r in scale_results]
-        control_diffs = [r['control_diff'] for r in scale_results]
+        control_means = [r['control_mean'] for r in scale_results]
+        control_stds = [r['control_std'] for r in scale_results]
+        z_scores = np.array([r['z_score'] for r in scale_results], dtype=float)
+        baseline_intro = baseline["intro_diff"]
+        baseline_control_mean = baseline["control_mean"]
+        baseline_control_std = baseline["control_std"]
 
-        fig = plt.figure(figsize=(14, 9))
-        ax = plt.subplot(111)
+        fig, ax = plt.subplots(figsize=(15, 9))
+        ax_z = ax.twinx()  # twin axis for z-score (feature #1)
 
-        # Plot baselines
-        plt.axhline(y=baseline_intro, color='blue', linestyle='--', linewidth=1.5, alpha=0.5,
+        # Baseline references
+        ax.axhline(y=baseline_intro, color='blue', linestyle='--', linewidth=1.5, alpha=0.5,
                    label=f'Baseline introspection: {baseline_intro:+.2f}')
-        plt.axhline(y=baseline_control, color='red', linestyle='--', linewidth=1.5, alpha=0.5,
-                   label=f'Baseline control: {baseline_control:+.2f}')
+        ax.axhline(y=baseline_control_mean, color='red', linestyle='--', linewidth=1.5, alpha=0.5,
+                   label=f'Baseline control mean: {baseline_control_mean:+.2f}')
 
-        # Plot introspection question (experimental)
-        plt.plot(scales, intro_diffs, 'o-', linewidth=2.5, markersize=8, color='blue',
-                label=f'Introspection question')
+        # Control battery band: mean +/- std (feature #1)
+        ctrl_means_arr = np.asarray(control_means)
+        ctrl_stds_arr = np.asarray(control_stds)
+        ax.fill_between(
+            scales, ctrl_means_arr - ctrl_stds_arr, ctrl_means_arr + ctrl_stds_arr,
+            color='red', alpha=0.18, label='Control battery band (+/- std)',
+        )
+        ax.plot(scales, control_means, 's-', linewidth=2, markersize=8, color='red',
+                label='Control battery mean')
 
-        # Plot control question (sanity check)
-        plt.plot(scales, control_diffs, 's-', linewidth=2.5, markersize=8, color='red',
-                label=f'Control question')
+        # Optional random-vector baseline band (feature #2)
+        if random_baseline and 'random_intro_diff' in scale_results[0]:
+            rand_intro = [r['random_intro_diff'] for r in scale_results]
+            rand_std = [r['random_intro_std'] for r in scale_results]
+            rand_arr = np.asarray(rand_intro)
+            rand_std_arr = np.asarray(rand_std)
+            ax.fill_between(
+                scales, rand_arr - rand_std_arr, rand_arr + rand_std_arr,
+                color='gray', alpha=0.18, label='Random-vector baseline band',
+            )
+            ax.plot(scales, rand_intro, '^-', linewidth=1.8, markersize=6, color='gray',
+                    label='Random-vector baseline')
 
-        # If multiple trials, show error bars
+        # Introspection
+        ax.plot(scales, intro_diffs, 'o-', linewidth=2.5, markersize=8, color='blue',
+                label='Introspection question')
+
         if len(scale_results[0]['all_intro_diffs']) > 1:
             intro_stds = [np.std(r['all_intro_diffs']) for r in scale_results]
-            control_stds = [np.std(r['all_control_diffs']) for r in scale_results]
-            plt.errorbar(scales, intro_diffs, yerr=intro_stds, fmt='none', ecolor='blue',
+            ax.errorbar(scales, intro_diffs, yerr=intro_stds, fmt='none', ecolor='blue',
                         capsize=5, alpha=0.4)
-            plt.errorbar(scales, control_diffs, yerr=control_stds, fmt='none', ecolor='red',
-                        capsize=5, alpha=0.4)
+
+        # z-score on twin axis (feature #1)
+        ax_z.plot(scales, z_scores, 'd--', linewidth=1.2, markersize=5, color='purple',
+                  alpha=0.85, label='z-score (intro vs battery)')
+        ax_z.axhline(y=0, color='purple', linestyle=':', linewidth=1, alpha=0.5)
+        ax_z.set_ylabel('z-score (introspection vs control battery)', fontsize=11, color='purple')
+        ax_z.tick_params(axis='y', labelcolor='purple')
 
         # Styling
-        plt.xlabel('Steering Vector Scale', fontsize=13)
-        plt.ylabel('Logit(Yes) - Logit(No)', fontsize=13)
+        ax.set_xlabel('Steering Vector Scale', fontsize=13)
+        ax.set_ylabel('Logit(Yes) - Logit(No)', fontsize=13)
 
-        # Build title with model and steering info
         model_display = self.model_name.split("/")[-1]
         steering_info = f'Contrastive Steering: "{contrastive_prompts[0]}" - "{contrastive_prompts[1]}" at layer {layer_idx}'
+        ax.set_title(f'Steering vector scale sweep\n{model_display}\n{steering_info}',
+                     fontsize=13, fontweight='bold', pad=20)
 
-        plt.title(f'Steering vector scale sweep\n{model_display}\n{steering_info}',
-                 fontsize=13, fontweight='bold', pad=20)
+        ax.grid(True, alpha=0.3)
+        ax.axhline(y=0, color='black', linestyle=':', linewidth=1, alpha=0.5)
 
-        plt.grid(True, alpha=0.3)
-        plt.legend(fontsize=10, loc='best')
-        plt.axhline(y=0, color='black', linestyle=':', linewidth=1, alpha=0.5)
-
-        # Add shaded region for "detects anomaly" (positive values)
-        y_min, y_max = plt.ylim()
+        y_min, y_max = ax.get_ylim()
         if y_max > 0:
-            plt.axhspan(0, y_max, alpha=0.05, color='green')
+            ax.axhspan(0, y_max, alpha=0.05, color='green')
         if y_min < 0:
-            plt.axhspan(y_min, 0, alpha=0.05, color='orange')
+            ax.axhspan(y_min, 0, alpha=0.05, color='orange')
 
-        # Add text box with questions
-        textstr = f'Introspection: "{self.introspection_question}"\n\nControl: "{self.control_question}"'
+        # Combined legend across both axes
+        h1, l1 = ax.get_legend_handles_labels()
+        h2, l2 = ax_z.get_legend_handles_labels()
+        ax.legend(h1 + h2, l1 + l2, fontsize=9, loc='best')
+
+        # Info text box
+        n_controls = len(baseline.get("control_diffs", []) or self.control_questions)
+        textstr = (
+            f'Introspection: "{self.introspection_question}"\n\n'
+            f'Control battery: {n_controls} questions (all "No"-expected)\n'
+            f'First control: "{self.control_questions[0]}"'
+        )
         props = dict(boxstyle='round', facecolor='wheat', alpha=0.3)
         ax.text(0.02, 0.98, textstr, transform=ax.transAxes, fontsize=9,
                 verticalalignment='top', bbox=props, family='monospace')
@@ -1066,7 +1596,10 @@ class IntrospectionExperiment:
 
         # Save plot
         model_short = self.model_name.split("/")[-1].replace(".", "_")
-        filename = f"introspection_{model_short}_contrastive_layer{layer_idx}_scale_sweep.png"
+        suffix = "_battery"
+        if random_baseline:
+            suffix += "_random"
+        filename = f"introspection_{model_short}_contrastive_layer{layer_idx}_scale_sweep{suffix}.png"
         plt.savefig(filename, dpi=150, bbox_inches='tight')
         print(f"\n[Plot saved to: {filename}]")
         plt.show()
@@ -1074,87 +1607,130 @@ class IntrospectionExperiment:
     def _plot_heatmaps(
         self,
         intro_matrix: np.ndarray,
-        control_matrix: np.ndarray,
+        control_mean_matrix: np.ndarray,
+        control_std_matrix: np.ndarray,
+        z_matrix: np.ndarray,
         layers: List[int],
         scales: List[float],
-        baseline_intro: float,
-        baseline_control: float,
-        contrastive_prompts: Tuple[str, str]
+        baseline: Dict,
+        contrastive_prompts: Tuple[str, str],
+        random_intro_matrix: Optional[np.ndarray] = None,
     ):
-        """Plot two heatmaps: introspection and control questions.
+        """Plot heatmaps for intro, control-battery mean, and z-score (feature #1).
+
+        Optionally includes a 4th panel for the random-vector baseline's
+        introspection matrix (feature #2). Layers run along x, scales along y.
 
         Args:
-            intro_matrix: Matrix of introspection logit differences (layers x scales)
-            control_matrix: Matrix of control logit differences (layers x scales)
+            intro_matrix: Introspection logit-diffs (layers x scales)
+            control_mean_matrix: Control battery mean (layers x scales)
+            control_std_matrix: Control battery std (layers x scales) -- shown
+                as a text overlay of the max-std condition
+            z_matrix: z-score of intro vs control battery (layers x scales)
             layers: Layer indices
             scales: Scale values
-            baseline_intro: Baseline introspection logit difference
-            baseline_control: Baseline control logit difference
+            baseline: Baseline stats dict (for annotations)
             contrastive_prompts: Tuple of (prompt1, prompt2) for title
+            random_intro_matrix: Optional random-baseline intro matrix (layers x scales)
         """
         model_display = self.model_name.split("/")[-1]
         model_short = model_display.replace(".", "_")
 
-        # Transpose matrices: layers horizontal (x-axis), scales vertical (y-axis)
-        intro_matrix_T = intro_matrix.T
-        control_matrix_T = control_matrix.T
+        # Transpose: layers horizontal (x-axis), scales vertical (y-axis)
+        intro_T = intro_matrix.T
+        ctrl_T = control_mean_matrix.T
+        z_T = np.ma.masked_invalid(z_matrix).T
 
-        # Create figure with two subplots side by side
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 8))
+        # Figure layout: 3 or 4 side-by-side panels
+        n_panels = 3 if random_intro_matrix is None else 4
+        fig, axes = plt.subplots(1, n_panels, figsize=(6 * n_panels, 8))
 
-        # Determine common color scale limits for both plots
-        vmin = min(intro_matrix.min(), control_matrix.min())
-        vmax = max(intro_matrix.max(), control_matrix.max())
-
-        # Use diverging colormap centered at 0
+        # Shared vmin/vmax for the intro / control panels (same units).
+        vmin = min(intro_matrix.min(), control_mean_matrix.min())
+        vmax = max(intro_matrix.max(), control_mean_matrix.max())
         norm = TwoSlopeNorm(vmin=vmin, vcenter=0, vmax=vmax)
         cmap = 'RdBu_r'  # Red for positive (Yes), Blue for negative (No)
 
-        # Plot 1: Introspection question
-        im1 = ax1.imshow(intro_matrix_T, aspect='auto', cmap=cmap, norm=norm,
-                         extent=[layers[0], layers[-1], scales[0], scales[-1]],
-                         origin='lower')
-        ax1.set_xlabel('Layer Index', fontsize=12)
-        ax1.set_ylabel('Steering Vector Scale', fontsize=12)
-        ax1.set_title(f'Introspection Question\n"{self.introspection_question}"',
-                     fontsize=11, fontweight='bold', pad=15)
+        extent = [layers[0], layers[-1], scales[0], scales[-1]]
 
-        # Add baseline text
-        ax1.text(0.02, 0.98, f'Baseline: {baseline_intro:+.2f}',
-                transform=ax1.transAxes, fontsize=10,
-                verticalalignment='top', bbox=dict(boxstyle='round',
-                facecolor='wheat', alpha=0.5))
+        # Panel 1: Introspection
+        im1 = axes[0].imshow(intro_T, aspect='auto', cmap=cmap, norm=norm,
+                             extent=extent, origin='lower')
+        axes[0].set_xlabel('Layer Index', fontsize=12)
+        axes[0].set_ylabel('Steering Vector Scale', fontsize=12)
+        axes[0].set_title(f'Introspection\n"{self.introspection_question}"',
+                          fontsize=11, fontweight='bold', pad=15)
+        axes[0].text(0.02, 0.98, f'Baseline: {baseline["intro_diff"]:+.2f}',
+                     transform=axes[0].transAxes, fontsize=10,
+                     verticalalignment='top',
+                     bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
 
-        # Plot 2: Control question
-        im2 = ax2.imshow(control_matrix_T, aspect='auto', cmap=cmap, norm=norm,
-                         extent=[layers[0], layers[-1], scales[0], scales[-1]],
-                         origin='lower')
-        ax2.set_xlabel('Layer Index', fontsize=12)
-        ax2.set_ylabel('Steering Vector Scale', fontsize=12)
-        ax2.set_title(f'Control Question\n"{self.control_question}"',
-                     fontsize=11, fontweight='bold', pad=15)
+        # Panel 2: Control battery mean
+        im2 = axes[1].imshow(ctrl_T, aspect='auto', cmap=cmap, norm=norm,
+                             extent=extent, origin='lower')
+        axes[1].set_xlabel('Layer Index', fontsize=12)
+        axes[1].set_ylabel('Steering Vector Scale', fontsize=12)
+        axes[1].set_title(f'Control battery mean ({len(self.control_questions)} questions)',
+                          fontsize=11, fontweight='bold', pad=15)
+        axes[1].text(0.02, 0.98,
+                     f'Baseline mean: {baseline["control_mean"]:+.2f}\n'
+                     f'Baseline std: {baseline["control_std"]:.2f}',
+                     transform=axes[1].transAxes, fontsize=10,
+                     verticalalignment='top',
+                     bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
 
-        # Add baseline text
-        ax2.text(0.02, 0.98, f'Baseline: {baseline_control:+.2f}',
-                transform=ax2.transAxes, fontsize=10,
-                verticalalignment='top', bbox=dict(boxstyle='round',
-                facecolor='wheat', alpha=0.5))
+        # Panel 3: z-score (feature #1). Symmetric diverging norm centered at 0
+        # with a useful |z|~3 cap so saturated regions read clearly.
+        z_finite = z_matrix[~np.isnan(z_matrix)]
+        if z_finite.size == 0:
+            zlim = 1.0
+        else:
+            zlim = min(6.0, max(3.0, np.nanmax(np.abs(z_finite))))
+        z_norm = TwoSlopeNorm(vmin=-zlim, vcenter=0, vmax=zlim)
+        im3 = axes[2].imshow(z_T, aspect='auto', cmap='Purples',
+                             norm=z_norm, extent=extent, origin='lower')
+        axes[2].set_xlabel('Layer Index', fontsize=12)
+        axes[2].set_ylabel('Steering Vector Scale', fontsize=12)
+        axes[2].set_title('z-score (intro vs control battery)\n'
+                          'dark = introspection stands out',
+                          fontsize=11, fontweight='bold', pad=15)
+
+        # Panel 4 (optional): random-vector baseline intro (feature #2)
+        if random_intro_matrix is not None:
+            rand_T = random_intro_matrix.T
+            r_vmin = min(intro_matrix.min(), random_intro_matrix.min())
+            r_vmax = max(intro_matrix.max(), random_intro_matrix.max())
+            r_norm = TwoSlopeNorm(vmin=r_vmin, vcenter=0, vmax=r_vmax)
+            axes[3].imshow(rand_T, aspect='auto', cmap=cmap, norm=r_norm,
+                           extent=extent, origin='lower')
+            axes[3].set_xlabel('Layer Index', fontsize=12)
+            axes[3].set_ylabel('Steering Vector Scale', fontsize=12)
+            axes[3].set_title('Random-vector baseline\n(matched norm)',
+                              fontsize=11, fontweight='bold', pad=15)
 
         # Main title
         steering_info = f'Contrastive: "{contrastive_prompts[0]}" vs "{contrastive_prompts[1]}"'
         fig.suptitle(f'LLM Introspection Heatmap: {model_display}\n{steering_info}',
-                    fontsize=13, fontweight='bold', y=0.98)
+                     fontsize=13, fontweight='bold', y=0.98)
 
-        # Add single shared colorbar
-        fig.subplots_adjust(right=0.92)
-        cbar_ax = fig.add_axes([0.94, 0.15, 0.02, 0.7])
+        # Shared colorbar for intro / control panels (logit-diff units)
+        fig.subplots_adjust(right=0.88)
+        cbar_ax = fig.add_axes([0.90, 0.55, 0.012, 0.32])
         cbar = fig.colorbar(im2, cax=cbar_ax)
         cbar.set_label('Logit(Yes) - Logit(No)', fontsize=11)
 
-        plt.tight_layout(rect=[0, 0, 0.92, 1])
+        # Separate colorbar for the z-score panel
+        cbar_z_ax = fig.add_axes([0.90, 0.10, 0.012, 0.32])
+        cbar_z = fig.colorbar(im3, cax=cbar_z_ax)
+        cbar_z.set_label('z-score', fontsize=11)
+
+        plt.tight_layout(rect=[0, 0, 0.88, 1])
 
         # Save plot
-        filename = f"introspection_{model_short}_heatmap.png"
+        suffix = "_battery"
+        if random_intro_matrix is not None:
+            suffix += "_random"
+        filename = f"introspection_{model_short}_heatmap{suffix}.png"
         plt.savefig(filename, dpi=150, bbox_inches='tight')
         print(f"\n[Heatmap saved to: {filename}]")
         plt.show()
@@ -1251,10 +1827,44 @@ Examples:
                        help="Layers to include in heatmap (default: all layers)")
     parser.add_argument("--heatmap-scales", nargs="+", type=float, default=None,
                        help="Scales to include in heatmap (default: 0-10)")
+    parser.add_argument("--no-line-plots", action="store_true",
+                       help="Skip line-plots when running --heatmap (default: "
+                            "generate both heatmap and line plots)")
+    parser.add_argument("--line-plot-layer", type=int, default=None,
+                       help="Layer for the scale-sweep line plot in --heatmap "
+                            "mode (default: middle layer)")
+    parser.add_argument("--line-plot-scale", type=float, default=None,
+                       help="Scale for the layer-sweep line plot in --heatmap "
+                            "mode (default: max non-zero scale)")
     parser.add_argument("--verbose", action="store_true",
                        help="Enable verbose output (default: only show progress)")
     parser.add_argument("--steer-all-tokens", action="store_true",
                        help="Apply steering to all token positions")
+
+    # ---- Feature #1: control battery -------------------------------------
+    parser.add_argument("--control-questions-file", type=str, default=None,
+                       help="Path to a file with one control question per line. "
+                            "Overrides the built-in 15-question battery.")
+    parser.add_argument("--num-controls", type=int, default=None,
+                       help="Randomly subsample this many control questions "
+                            "from the battery (default: use all). Useful to "
+                            "trade off runtime on large sweeps.")
+    parser.add_argument("--legacy-single-control", action="store_true",
+                       help="Reproduce the original Godet experiment with only "
+                            "the '1+1=3?' control question (z-scores will be "
+                            "nan since std=0). Disables the battery.")
+
+    # ---- Feature #2: random-vector baseline -------------------------------
+    parser.add_argument("--random-baseline", action="store_true",
+                       help="Also run N random norm-matched vectors per "
+                            "condition to isolate 'magnitude' effects from "
+                            "'direction' (semantic-content) effects.")
+    parser.add_argument("--num-random-seeds", type=int, default=DEFAULT_NUM_RANDOM_SEEDS,
+                       help=f"Number of random vectors averaged per condition "
+                            f"(default: {DEFAULT_NUM_RANDOM_SEEDS})")
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED,
+                       help=f"Base seed for the random-vector generator "
+                            f"(default: {DEFAULT_SEED})")
 
     args = parser.parse_args()
 
@@ -1275,7 +1885,32 @@ Examples:
         print(f"  Prompt 1: {repr(contrastive_prompts[0])}")
         print(f"  Prompt 2: {repr(contrastive_prompts[1])}\n")
 
-    experiment = IntrospectionExperiment(model_name=model_name, verbose=args.verbose)
+    # Assemble the control battery (feature #1)
+    if args.control_questions_file:
+        with open(args.control_questions_file, "r") as f:
+            control_questions = [line.strip() for line in f if line.strip()]
+        if not control_questions:
+            raise ValueError(f"No control questions found in {args.control_questions_file}")
+        print(f"Loaded {len(control_questions)} control questions from {args.control_questions_file}")
+    else:
+        control_questions = list(DEFAULT_CONTROL_QUESTIONS)
+
+    if args.legacy_single_control:
+        control_questions = [control_questions[0]]
+        print("Legacy single-control mode: using only '"
+              + control_questions[0] + "' as control (z-scores will be nan).")
+    elif args.num_controls is not None and args.num_controls < len(control_questions):
+        # Deterministic subsample so re-runs are reproducible.
+        rng = random.Random(args.seed)
+        control_questions = rng.sample(control_questions, args.num_controls)
+        print(f"Subsampled to {len(control_questions)} control questions.")
+
+    experiment = IntrospectionExperiment(
+        model_name=model_name,
+        verbose=args.verbose,
+        control_questions=control_questions,
+        seed=args.seed,
+    )
 
     # Choose experiment type
     if args.heatmap:
@@ -1285,7 +1920,12 @@ Examples:
             scales=args.heatmap_scales,
             token_pos=args.token_pos,
             contrastive_prompts=contrastive_prompts,
-            steer_all_tokens=args.steer_all_tokens
+            steer_all_tokens=args.steer_all_tokens,
+            random_baseline=args.random_baseline,
+            num_random_seeds=args.num_random_seeds,
+            line_plots=not args.no_line_plots,
+            line_plot_layer=args.line_plot_layer,
+            line_plot_scale=args.line_plot_scale,
         )
     elif args.generate:
         num_layers = len(experiment.layer_modules)
@@ -1317,7 +1957,9 @@ Examples:
             token_pos=args.token_pos,
             contrastive_prompts=contrastive_prompts,
             plot=True,
-            steer_all_tokens=args.steer_all_tokens
+            steer_all_tokens=args.steer_all_tokens,
+            random_baseline=args.random_baseline,
+            num_random_seeds=args.num_random_seeds,
         )
     else:
         experiment.run_full_experiment(
@@ -1327,7 +1969,9 @@ Examples:
             token_pos=args.token_pos,
             contrastive_prompts=contrastive_prompts,
             plot=True,
-            steer_all_tokens=args.steer_all_tokens
+            steer_all_tokens=args.steer_all_tokens,
+            random_baseline=args.random_baseline,
+            num_random_seeds=args.num_random_seeds,
         )
 
 
