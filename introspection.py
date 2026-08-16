@@ -168,9 +168,6 @@ class IntrospectionExperiment:
 
         # RNG for the random-vector baseline (feature #2).
         self.seed = seed
-        self._base_rng = torch.Generator(device=self.device).manual_seed(seed)
-        # A separate, advanceable generator so seeding once stays reproducible
-        # across many random-vector draws.
         self._rng = torch.Generator(device=self.device).manual_seed(seed)
 
         # Cache of contrastive diff vectors keyed by (layer_idx, prompt1, prompt2).
@@ -343,7 +340,7 @@ class IntrospectionExperiment:
             raise ValueError("contrastive_prompts is required")
 
         prompt1, prompt2 = contrastive_prompts
-        cache_key = (layer_idx, prompt1, prompt2)
+        cache_key = (layer_idx, prompt1, prompt2, token_pos)
 
         # Compute or fetch the contrastive diff vector (and its norm).
         if cache_key not in self._contrastive_cache:
@@ -552,6 +549,27 @@ class IntrospectionExperiment:
             "percentile": percentile,
         }
 
+    def _derive_seed(self, seed_idx: int, layer_idx: int = 0, scale: float = 0.0) -> int:
+        """Deterministically derive a child seed from experiment parameters.
+
+        Builds a string key from (seed, seed_idx, layer_idx, scale) and
+        seeds a fresh ``random.Random`` with it, so different parameter
+        combinations never collide regardless of magnitudes and the result
+        is reproducible across processes. The string key avoids the
+        ``random.Random`` restriction that only allows None/int/float/str/
+        bytes/bytearray seeds.
+
+        Args:
+            seed_idx: Random-vector draw index within a condition
+            layer_idx: Layer being steered at
+            scale: Steering scale for this condition
+
+        Returns:
+            An integer seed suitable for ``torch.Generator().manual_seed()``
+        """
+        key = f"{self.seed}|{seed_idx}|{layer_idx}|{scale:.6f}"
+        return random.Random(key).randrange(2**31)
+
     def _log_logits_summary(
         self, label: str, top_logits, yes_no_diff: float
     ) -> None:
@@ -666,7 +684,8 @@ class IntrospectionExperiment:
                 if steer_all_tokens:
                     modified_states = modified_states + steering_vector.unsqueeze(0).unsqueeze(0)
                 else:
-                    modified_states[:, token_pos, :] = modified_states[:, token_pos, :] + steering_vector
+                    if hidden_states.shape[1] > abs(token_pos):
+                        modified_states[:, token_pos, :] = modified_states[:, token_pos, :] + steering_vector
                 return (modified_states,) + output[1:]
             else:
                 hidden_states = output
@@ -674,7 +693,8 @@ class IntrospectionExperiment:
                 if steer_all_tokens:
                     modified_states = modified_states + steering_vector.unsqueeze(0).unsqueeze(0)
                 else:
-                    modified_states[:, token_pos, :] = modified_states[:, token_pos, :] + steering_vector
+                    if hidden_states.shape[1] > abs(token_pos):
+                        modified_states[:, token_pos, :] = modified_states[:, token_pos, :] + steering_vector
                 return modified_states
 
         hook_handle = self.layer_modules[layer_idx].register_forward_hook(steering_hook)
@@ -817,8 +837,9 @@ class IntrospectionExperiment:
                 rand_control_stds = []
                 for seed_idx in range(num_random_seeds):
                     # Use a fresh child generator per seed for reproducibility.
-                    child_seed = self.seed + 1000 * seed_idx + layer_idx + 1
-                    child_rng = torch.Generator(device=self.device).manual_seed(child_seed)
+                    child_rng = torch.Generator(device=self.device).manual_seed(
+                        self._derive_seed(seed_idx, layer_idx=layer_idx, scale=magnitude)
+                    )
                     if self.verbose:
                         print(f"[Random seed {seed_idx+1}/{num_random_seeds}]")
                     res = self.run_with_steering(
@@ -920,6 +941,14 @@ class IntrospectionExperiment:
                     "all_control_means": [baseline["control_mean"]] * num_trials,
                     "all_control_stds": [baseline["control_std"]] * num_trials,
                 }
+                # Match the random-baseline keys so the plotting check
+                # 'random_intro_diff' in scale_results[0] doesn't silently
+                # drop the random band when scale=0 is the first entry.
+                if random_baseline:
+                    entry["random_intro_diff"] = baseline["intro_diff"]
+                    entry["random_intro_std"] = 0.0
+                    entry["random_control_mean"] = baseline["control_mean"]
+                    entry["all_random_intro_diffs"] = [baseline["intro_diff"]]
                 if self.verbose:
                     print(f"  Using baseline (no steering)")
                     print(f"  Introspection: {entry['intro_diff']:+.3f}")
@@ -963,8 +992,9 @@ class IntrospectionExperiment:
                 rand_intro_diffs = []
                 rand_control_means = []
                 for seed_idx in range(num_random_seeds):
-                    child_seed = self.seed + 1000 * seed_idx + int(scale * 10) + 1
-                    child_rng = torch.Generator(device=self.device).manual_seed(child_seed)
+                    child_rng = torch.Generator(device=self.device).manual_seed(
+                        self._derive_seed(seed_idx, layer_idx=layer_idx, scale=scale)
+                    )
                     if self.verbose:
                         print(f"[Random seed {seed_idx+1}/{num_random_seeds}]")
                     res = self.run_with_steering(
@@ -1185,8 +1215,9 @@ class IntrospectionExperiment:
                 if random_baseline and scale != 0:
                     rand_intro_diffs = []
                     for seed_idx in range(num_random_seeds):
-                        child_seed = self.seed + 1000 * seed_idx + 100 * layer_idx + int(scale * 10) + 1
-                        child_rng = torch.Generator(device=self.device).manual_seed(child_seed)
+                        child_rng = torch.Generator(device=self.device).manual_seed(
+                            self._derive_seed(seed_idx, layer_idx=layer_idx, scale=scale)
+                        )
                         if self.verbose:
                             print(f"[Random seed {seed_idx+1}/{num_random_seeds}]")
                         r_res = self.run_with_steering(
