@@ -20,6 +20,19 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import TwoSlopeNorm
 
 
+def _diverging_norm(vmin, vmax):
+    """TwoSlopeNorm centered at 0, safe when the data sits entirely on one side.
+
+    Matplotlib requires vmin < vcenter < vmax strictly. Steering logit-diffs can
+    be all-negative (Qwen2.5-1.5B) or all-positive, so pad whichever side is
+    empty rather than crashing at plot time.
+    """
+    vmin = float(vmin)
+    vmax = float(vmax)
+    pad = max(abs(vmin), abs(vmax), 1e-6) * 0.01
+    return TwoSlopeNorm(vmin=min(vmin, -pad), vcenter=0, vmax=max(vmax, pad))
+
+
 # Model configurations for systematic size comparison
 MODEL_CONFIGS = {
     # Qwen2.5-Instruct family (primary)
@@ -1779,7 +1792,7 @@ class IntrospectionExperiment:
         # Shared vmin/vmax for the intro / control panels (same units).
         vmin = min(intro_matrix.min(), control_mean_matrix.min())
         vmax = max(intro_matrix.max(), control_mean_matrix.max())
-        norm = TwoSlopeNorm(vmin=vmin, vcenter=0, vmax=vmax)
+        norm = _diverging_norm(vmin, vmax)
         cmap = 'RdBu_r'  # Red for positive (Yes), Blue for negative (No)
 
         extent = [layers[0], layers[-1], scales[0], scales[-1]]
@@ -1817,7 +1830,7 @@ class IntrospectionExperiment:
             zlim = 1.0
         else:
             zlim = min(6.0, max(3.0, np.nanmax(np.abs(z_finite))))
-        z_norm = TwoSlopeNorm(vmin=-zlim, vcenter=0, vmax=zlim)
+        z_norm = _diverging_norm(-zlim, zlim)
         im3 = axes[2].imshow(z_T, aspect='auto', cmap='Purples',
                              norm=z_norm, extent=extent, origin='lower')
         axes[2].set_xlabel('Layer Index', fontsize=12)
@@ -1831,7 +1844,7 @@ class IntrospectionExperiment:
             rand_T = random_intro_matrix.T
             r_vmin = min(intro_matrix.min(), random_intro_matrix.min())
             r_vmax = max(intro_matrix.max(), random_intro_matrix.max())
-            r_norm = TwoSlopeNorm(vmin=r_vmin, vcenter=0, vmax=r_vmax)
+            r_norm = _diverging_norm(r_vmin, r_vmax)
             axes[3].imshow(rand_T, aspect='auto', cmap=cmap, norm=r_norm,
                            extent=extent, origin='lower')
             axes[3].set_xlabel('Layer Index', fontsize=12)
