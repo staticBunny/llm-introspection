@@ -9,7 +9,10 @@ activations when steering vectors are injected at specific layers.
 import torch
 import torch.nn.functional as F
 import argparse
+import os
+import json
 import random
+from datetime import datetime
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from typing import Optional, Dict, List, Tuple
 import numpy as np
@@ -122,6 +125,7 @@ class IntrospectionExperiment:
         verbose: bool = True,
         control_questions: Optional[List[str]] = None,
         seed: int = DEFAULT_SEED,
+        run_name: Optional[str] = None,
     ):
         """Initialize the experiment with a language model.
 
@@ -130,6 +134,9 @@ class IntrospectionExperiment:
             verbose: Whether to print detailed progress information
             control_questions: List of Yes/No control questions (default: full battery)
             seed: Seed for the random-vector baseline RNG (reproducibility)
+            run_name: Name for the output subfolder under plots/. If None,
+                defaults to "<model_short>_<battery|battery-random>" so each
+                run is isolated. All figures are saved to plots/<run_name>/.
         """
         self.verbose = verbose
         if self.verbose:
@@ -174,9 +181,18 @@ class IntrospectionExperiment:
         self.seed = seed
         self._rng = torch.Generator(device=self.device).manual_seed(seed)
 
-        # Cache of contrastive diff vectors keyed by (layer_idx, prompt1, prompt2).
+        # Cache of contrastive diff vectors keyed by (layer_idx, prompt1, prompt2, token_pos).
         # Avoids recomputation across the control battery, trials and random seeds.
-        self._contrastive_cache: Dict[Tuple[int, str, str], torch.Tensor] = {}
+        self._contrastive_cache: Dict[Tuple[int, str, str, int], torch.Tensor] = {}
+
+        # Output folder for plots. Each run gets its own subfolder under plots/
+        # so figures from different models/configs don't clobber each other.
+        model_short = model_name.split("/")[-1].replace(".", "_").replace("-", "_").lower()
+        if run_name is None:
+            run_name = f"{model_short}_battery-random"
+        self.run_name = run_name
+        self.plot_dir = os.path.join("plots", run_name)
+        os.makedirs(self.plot_dir, exist_ok=True)
 
         # Cache Yes/No token IDs
         self._setup_yes_no_tokens()
@@ -574,6 +590,65 @@ class IntrospectionExperiment:
         key = f"{self.seed}|{seed_idx}|{layer_idx}|{scale:.6f}"
         return random.Random(key).randrange(2**31)
 
+    def _save_results_json(self, kind: str, results, baseline: Dict,
+                           contrastive_prompts: Tuple[str, str],
+                           extra: Optional[Dict] = None) -> str:
+        """Dump a run's results to <plot_dir>/results.json for later analysis.
+
+        Produces a normalized schema so layer-sweep, scale-sweep, and heatmap
+        runs can all be read back by the same analysis script. Handles NaN
+        (from the std==0 z-score guard) and numpy types so the JSON is clean.
+
+        Args:
+            kind: "layer_sweep" | "scale_sweep" | "heatmap"
+            results: The list-of-dicts (layer/scale sweep) or results dict
+                     (heatmap) returned by the sweep method.
+            baseline: Baseline stats dict from run_baseline().
+            contrastive_prompts: (prompt1, prompt2) used for steering.
+            extra: Optional dict of extra metadata (e.g. matrices for heatmap).
+
+        Returns:
+            The path to the saved JSON file.
+        """
+        def _clean(obj):
+            if isinstance(obj, dict):
+                return {k: _clean(v) for k, v in obj.items()}
+            if isinstance(obj, (list, tuple)):
+                return [_clean(v) for v in obj]
+            if isinstance(obj, np.ndarray):
+                return _clean(obj.tolist())
+            if isinstance(obj, (np.floating, np.integer)):
+                obj = obj.item()
+            if isinstance(obj, float):
+                return None if np.isnan(obj) else obj
+            return obj
+
+        payload = {
+            "kind": kind,
+            "model": self.model_name,
+            "run_name": self.run_name,
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "seed": self.seed,
+            "contrastive_prompts": list(contrastive_prompts),
+            "control_questions": list(self.control_questions),
+            "num_controls": len(self.control_questions),
+            "baseline": _clean(baseline),
+            "extra": _clean(extra) if extra else {},
+        }
+
+        if kind == "heatmap":
+            # results is a dict with matrices + metadata
+            payload["heatmap"] = _clean(results)
+        else:
+            # results is a list of per-condition dicts
+            payload["conditions"] = _clean(results)
+
+        path = os.path.join(self.plot_dir, "results.json")
+        with open(path, "w") as f:
+            json.dump(payload, f, indent=2)
+        print(f"\n[Results JSON saved to: {path}]")
+        return path
+
     def _log_logits_summary(
         self, label: str, top_logits, yes_no_diff: float
     ) -> None:
@@ -869,6 +944,12 @@ class IntrospectionExperiment:
                 contrastive_prompts, random_baseline=random_baseline,
             )
 
+        self._save_results_json(
+            "layer_sweep", layer_results, baseline, contrastive_prompts,
+            extra={"magnitude": magnitude, "random_baseline": random_baseline,
+                   "num_random_seeds": num_random_seeds if random_baseline else 0},
+        )
+
         return layer_results
 
     def run_scale_sweep(
@@ -1028,6 +1109,12 @@ class IntrospectionExperiment:
                 scale_results, baseline, layer_idx,
                 contrastive_prompts, random_baseline=random_baseline,
             )
+
+        self._save_results_json(
+            "scale_sweep", scale_results, baseline, contrastive_prompts,
+            extra={"layer_idx": layer_idx, "random_baseline": random_baseline,
+                   "num_random_seeds": num_random_seeds if random_baseline else 0},
+        )
 
         return scale_results
 
@@ -1288,7 +1375,7 @@ class IntrospectionExperiment:
                 contrastive_prompts, random_baseline=random_baseline,
             )
 
-        return {
+        heatmap_result = {
             "layers": layers,
             "scales": scales,
             "intro_matrix": intro_matrix,
@@ -1302,6 +1389,13 @@ class IntrospectionExperiment:
             "random_intro_matrix": random_intro_matrix,
         }
 
+        self._save_results_json(
+            "heatmap", heatmap_result, baseline, contrastive_prompts,
+            extra={"random_baseline": random_baseline,
+                   "num_random_seeds": num_random_seeds if random_baseline else 0},
+        )
+
+        return heatmap_result
     def run_generation_experiment(
         self,
         layer_idx: int,
@@ -1508,11 +1602,12 @@ class IntrospectionExperiment:
         plt.tight_layout()
 
         # Save plot
-        model_short = self.model_name.split("/")[-1].replace(".", "_")
         suffix = "_battery"
         if random_baseline:
             suffix += "_random"
-        filename = f"introspection_{model_short}_contrastive_scale{magnitude}{suffix}.png"
+        filename = os.path.join(
+            self.plot_dir, f"layer_sweep_scale{magnitude}{suffix}.png"
+        )
         plt.savefig(filename, dpi=150, bbox_inches='tight')
         print(f"\n[Plot saved to: {filename}]")
         plt.show()
@@ -1630,11 +1725,12 @@ class IntrospectionExperiment:
         plt.tight_layout()
 
         # Save plot
-        model_short = self.model_name.split("/")[-1].replace(".", "_")
         suffix = "_battery"
         if random_baseline:
             suffix += "_random"
-        filename = f"introspection_{model_short}_contrastive_layer{layer_idx}_scale_sweep{suffix}.png"
+        filename = os.path.join(
+            self.plot_dir, f"scale_sweep_layer{layer_idx}{suffix}.png"
+        )
         plt.savefig(filename, dpi=150, bbox_inches='tight')
         print(f"\n[Plot saved to: {filename}]")
         plt.show()
@@ -1765,7 +1861,7 @@ class IntrospectionExperiment:
         suffix = "_battery"
         if random_intro_matrix is not None:
             suffix += "_random"
-        filename = f"introspection_{model_short}_heatmap{suffix}.png"
+        filename = os.path.join(self.plot_dir, f"heatmap{suffix}.png")
         plt.savefig(filename, dpi=150, bbox_inches='tight')
         print(f"\n[Heatmap saved to: {filename}]")
         plt.show()
@@ -1900,6 +1996,10 @@ Examples:
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED,
                        help=f"Base seed for the random-vector generator "
                             f"(default: {DEFAULT_SEED})")
+    parser.add_argument("--run-name", type=str, default=None,
+                       help="Name for the output subfolder under plots/ "
+                            "(default: <model_short>_battery-random). All "
+                            "figures from this run are saved to plots/<run_name>/.")
 
     args = parser.parse_args()
 
@@ -1945,6 +2045,7 @@ Examples:
         verbose=args.verbose,
         control_questions=control_questions,
         seed=args.seed,
+        run_name=args.run_name,
     )
 
     # Choose experiment type
