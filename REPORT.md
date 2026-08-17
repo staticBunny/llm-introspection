@@ -150,7 +150,25 @@ At 1.5B, the picture is murkier: random vectors at mid-layers and high scales ca
 - **No statistical test across conditions.** A Wilcoxon signed-rank or permutation test pooling all conditions would give a single p-value rather than per-condition z-scores.
 - **Logit-diff only, no generation.** We measure Yes/No logit-difference, not free-text responses. A generation condition (asking the model to describe the injected thought) would test *identification*, not just *detection*.
 
-## 6. Conclusion
+## 6. Future work
+
+The infrastructure built for this study (control battery, random-vector baseline, z-score statistics, `results.json` output) directly supports several extensions:
+
+1. **Tighten the statistics.** Scale the control battery to 15+ questions and the random baseline to 10+ seeds. Add a pooled Wilcoxon signed-rank test across all conditions for a single headline p-value instead of per-condition z-scores.
+
+2. **Symmetric z-scores for the random baseline.** Run the random vectors through the control battery (not just the introspection question) so contrastive and random conditions both produce z-scores — a direct apples-to-apples comparison.
+
+3. **Finer layer sweep at 32B.** The current 5-layer grid misses where the separation emerges across 64 layers. A full layer sweep (every 4th layer, say) would localize the effect and enable a logit-lens trace of where Yes/No divergence appears.
+
+4. **Multiple contrastive pairs.** Test the 50 semantic pairs in `prompts.txt` (e.g., "love" vs "emotion", "death" vs "end") to check whether the effect generalizes beyond the caps example or is prompt-specific.
+
+5. **Free-generation condition.** After injecting a concept vector, ask the model to *describe* the injected thought rather than answer Yes/No. This tests *identification* (what is the thought?) rather than *detection* (is there a thought?) — a strictly stronger claim.
+
+6. **Attention-head localization + ablation.** Identify attention heads that attend disproportionately to the injection position when the model answers "Yes" to introspection vs. control, then ablate them and rerun. A selective drop in the introspection effect (with the control "Yes"-bias preserved) would be mechanistic evidence of dissociation.
+
+7. **Intermediate models.** The jump from 1.5B to 32B is large. Running 3B, 7B, and 14B would chart the scaling curve more precisely and may reveal a phase transition.
+
+## 7. Conclusion
 
 Godet's conclusion — that the introspection effect in small LLMs is attributable to confusion noise — is confirmed for the 0.5B model. However, the effect **emerges with scale**: at 32B, the introspection question consistently separates from the control battery (z-scores 3–7, 75% of conditions z>2), and the contrastive vector behaves distinctly from norm-matched random vectors. This does not prove genuine introspection, but it shows that the confusion-noise explanation alone is insufficient for larger models. The mechanism by which the 32B model distinguishes the introspection question from unrelated Yes/No questions — both at baseline and under steering — warrants further investigation.
 
